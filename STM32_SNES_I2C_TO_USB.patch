@@ -1,0 +1,319 @@
+Index: Core/Src/main.c
+===================================================================
+--- Core/Src/main.c	(revision 1)
++++ Core/Src/main.c	(revision 3)
+@@ -58,6 +58,40 @@
+ /* Private user code ---------------------------------------------------------*/
+ /* USER CODE BEGIN 0 */
+ 
++#include "usbd_hid.h"
++extern USBD_HandleTypeDef hUsbDeviceFS;
++
++// https://github.com/leech001/micros/blob/master/Inc/micros.h
++__STATIC_INLINE void DWT_Init(void)
++{
++	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk; // разрешаем использовать счётчик
++	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;   // запускаем счётчик
++}
++__STATIC_INLINE void delay_us(uint32_t us)
++{
++	uint32_t us_count_tic =  us * (SystemCoreClock / 1000000U);
++	DWT->CYCCNT = 0U;
++	while(DWT->CYCCNT < us_count_tic);
++}
++
++// func from nintendo driver sources
++#define DF3_BTN_R      1
++#define DF3_BTN_START  2
++#define DF3_BTN_SELECT 4
++#define DF3_BTN_L      5
++#define DF3_BTN_DOWN   6
++#define DF3_BTN_RIGHT  7
++#define DF3_BTN_UP     0
++#define DF3_BTN_LEFT   1
++#define DF3_BTN_X      3
++#define DF3_BTN_A      4
++#define DF3_BTN_Y      5
++#define DF3_BTN_B      6
++static unsigned char get_bit(unsigned char data, int bitnum)
++{
++	return (data & (1 << bitnum)) >> bitnum;
++}
++
+ /* USER CODE END 0 */
+ 
+ /**
+@@ -92,6 +126,124 @@
+   MX_USB_DEVICE_Init();
+   /* USER CODE BEGIN 2 */
+ 
++	DWT_Init();
++
++    int connected = 0;
++    unsigned char data_i2c[21];
++    unsigned char data_usb[10];
++
++	#define ADDR (0x52 << 1)
++	#define DELAY 5
++
++    #define DELAY_STEP1 200
++	#define DELAY_STEP2 200
++	#define DELAY_STEP3 400
++
++    int r = 0, start = 0, select_ = 0, l = 0, down = 0, right = 0, up = 0, left = 0, x = 0, a = 0, y = 0, b = 0;
++
++    HAL_StatusTypeDef ret;
++    while(1)
++    {
++    	if(connected == 0)
++    	{
++    		delay_us(DELAY_STEP2);
++			
++			// -> 2b: f0 55
++			data_i2c[0] = 0xf0;
++			data_i2c[1] = 0x55;
++			ret = HAL_I2C_Master_Transmit(&hi2c1, ADDR, data_i2c, 2, DELAY); // timeout in ticks, tick is 1 ms
++			delay_us(DELAY_STEP1);
++			if(ret != 0) continue;
++
++    		// -> 2b: fb 00
++			data_i2c[0] = 0xfb;
++			data_i2c[1] = 0x00;
++			ret = HAL_I2C_Master_Transmit(&hi2c1, ADDR, data_i2c, 2, DELAY);
++			if(ret != 0) continue;
++			delay_us(DELAY_STEP1);
++
++			// -> 2b: fe 03 // 03 - data format, 3 in driver
++			data_i2c[0] = 0xfe;
++			data_i2c[1] = 0x03;
++			ret = HAL_I2C_Master_Transmit(&hi2c1, ADDR, data_i2c, 2, DELAY);
++			if(ret != 0) continue;
++			delay_us(DELAY_STEP1);
++
++			// -> 1b: fa
++			data_i2c[0] = 0xfa;
++			ret = HAL_I2C_Master_Transmit(&hi2c1, ADDR, data_i2c, 1, DELAY);
++			if(ret != 0) continue;
++			delay_us(DELAY_STEP2); // wait 150-200 us // in raspberry pi driver in this init sequence it waits only 10 us
++
++			// <- 6b: ?? ?? ?? ?? df id // df - data format, 3 in driver; id - controller id, 1 in driver
++			if(HAL_I2C_Master_Receive(&hi2c1, ADDR, data_i2c, 6, DELAY) == HAL_OK)
++			{
++				if((data_i2c[4] == 0x03) && (data_i2c[5] == 0x01))
++				{
++					connected = 1;
++					//HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, (GPIO_PinState) 1); // 9 - green
++				}
++				delay_us(DELAY_STEP2);
++			}
++			else
++			{
++				connected = 0;
++				//HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, (GPIO_PinState) 0); // 9 - green
++			}
++    	}
++
++    	if(connected == 1)
++    	{
++    		// -> 1b: 00
++    		data_i2c[0] = 0x06; // 0x00; // read address 0 -> 6
++			ret = HAL_I2C_Master_Transmit(&hi2c1, ADDR, data_i2c, 1, DELAY);
++			if(ret != 0)
++			{
++				connected = 0;
++				//HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, (GPIO_PinState) 0); // 9 - green
++				continue;
++			}
++			delay_us(DELAY_STEP2); // wait 150-200 us // in raspberry pi driver it waits only 120 us
++
++			// <- 21b: ?? ?? ?? ??  ?? ?? b0 b1  00 00 00 00  00 00 00 00  00 00 00 00  00 // b0, b1 - buttons of snes mini controller
++			if(HAL_I2C_Master_Receive(&hi2c1, ADDR, &data_i2c[6], 2, DELAY) == HAL_OK) // read 2 bytes instead 21 for mininize delay
++			{
++				// interpret data
++				r      = !get_bit(data_i2c[6], DF3_BTN_R);
++				start  = !get_bit(data_i2c[6], DF3_BTN_START);
++				select_= !get_bit(data_i2c[6], DF3_BTN_SELECT);
++				l      = !get_bit(data_i2c[6], DF3_BTN_L);
++				down   = !get_bit(data_i2c[6], DF3_BTN_DOWN);
++				right  = !get_bit(data_i2c[6], DF3_BTN_RIGHT);
++				up     = !get_bit(data_i2c[7], DF3_BTN_UP);
++				left   = !get_bit(data_i2c[7], DF3_BTN_LEFT);
++				x      = !get_bit(data_i2c[7], DF3_BTN_X);
++				a      = !get_bit(data_i2c[7], DF3_BTN_A);
++				y      = !get_bit(data_i2c[7], DF3_BTN_Y);
++				b      = !get_bit(data_i2c[7], DF3_BTN_B);
++
++				// RAM Factory Store usb gamepad hub protocol
++				// 1 byte - ID (1)
++				data_usb[0] = 1;
++				// 6 bytes - X, Y, Z, Rx, Ry, Rz (0x81 - min, 0x7F - max)
++				data_usb[1] = left ? 0x81 : right ? 0x7F : 0; // left - 0x81, right - 0x7F, center = 0
++				data_usb[2] = up ? 0x81: down ? 0x7F : 0; // up - 0x81, down - 0x7F, center = 0
++				data_usb[3] = data_usb[4] = data_usb[5] = data_usb[6] = 0;
++				// 2 bytes - 16 bits of buttons values
++				data_usb[7] = (b << 0) | (a << 1) | (y << 2) | (x << 3) | (select_ << 4) | (start << 5) | (l << 6) | (r << 7);
++				data_usb[8] = 0;
++				USBD_HID_SendReport(&hUsbDeviceFS, data_usb, 9);
++
++				delay_us(DELAY_STEP3 - DELAY_STEP2); // sub delay after sending read command
++			}
++			else
++			{
++				connected = 0;
++				//HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, (GPIO_PinState) 0); // 9 - green
++			}
++    	}
++    }
++
+   /* USER CODE END 2 */
+ 
+   /* Infinite loop */
+Index: Middlewares/ST/STM32_USB_Device_Library/Class/HID/Inc/usbd_hid.h
+===================================================================
+--- Middlewares/ST/STM32_USB_Device_Library/Class/HID/Inc/usbd_hid.h	(revision 1)
++++ Middlewares/ST/STM32_USB_Device_Library/Class/HID/Inc/usbd_hid.h	(revision 3)
+@@ -42,11 +42,11 @@
+   * @{
+   */
+ #define HID_EPIN_ADDR                 0x81U
+-#define HID_EPIN_SIZE                 0x04U
++#define HID_EPIN_SIZE                 9 // CHANGED 4 -> 9
+ 
+ #define USB_HID_CONFIG_DESC_SIZ       34U
+ #define USB_HID_DESC_SIZ              9U
+-#define HID_MOUSE_REPORT_DESC_SIZE    74U
++#define HID_MOUSE_REPORT_DESC_SIZE    52 // CHANGED 74 -> 52
+ 
+ #define HID_DESCRIPTOR_TYPE           0x21U
+ #define HID_REPORT_DESC               0x22U
+Index: Middlewares/ST/STM32_USB_Device_Library/Class/HID/Src/usbd_hid.c
+===================================================================
+--- Middlewares/ST/STM32_USB_Device_Library/Class/HID/Src/usbd_hid.c	(revision 1)
++++ Middlewares/ST/STM32_USB_Device_Library/Class/HID/Src/usbd_hid.c	(revision 3)
+@@ -157,8 +157,8 @@
+   0x00,         /*bAlternateSetting: Alternate setting*/
+   0x01,         /*bNumEndpoints*/
+   0x03,         /*bInterfaceClass: HID*/
+-  0x01,         /*bInterfaceSubClass : 1=BOOT, 0=no boot*/
+-  0x02,         /*nInterfaceProtocol : 0=none, 1=keyboard, 2=mouse*/
++  0x00,         /*bInterfaceSubClass : 1=BOOT, 0=no boot*/ // CHANGE 1 -> 0
++  0x00,         /*nInterfaceProtocol : 0=none, 1=keyboard, 2=mouse*/ // CHANGE 2 -> 0
+   0,            /*iInterface: Index of string descriptor*/
+   /******************** Descriptor of Joystick Mouse HID ********************/
+   /* 18 */
+@@ -207,8 +207,8 @@
+   0x00,         /*bAlternateSetting: Alternate setting*/
+   0x01,         /*bNumEndpoints*/
+   0x03,         /*bInterfaceClass: HID*/
+-  0x01,         /*bInterfaceSubClass : 1=BOOT, 0=no boot*/
+-  0x02,         /*nInterfaceProtocol : 0=none, 1=keyboard, 2=mouse*/
++  0x00,         /*bInterfaceSubClass : 1=BOOT, 0=no boot*/ // CHANGE 1 -> 0
++  0x00,         /*nInterfaceProtocol : 0=none, 1=keyboard, 2=mouse*/ // CHANGE 2 -> 0
+   0,            /*iInterface: Index of string descriptor*/
+   /******************** Descriptor of Joystick Mouse HID ********************/
+   /* 18 */
+@@ -257,8 +257,8 @@
+   0x00,         /*bAlternateSetting: Alternate setting*/
+   0x01,         /*bNumEndpoints*/
+   0x03,         /*bInterfaceClass: HID*/
+-  0x01,         /*bInterfaceSubClass : 1=BOOT, 0=no boot*/
+-  0x02,         /*nInterfaceProtocol : 0=none, 1=keyboard, 2=mouse*/
++  0x00,         /*bInterfaceSubClass : 1=BOOT, 0=no boot*/ // CHANGE 1 -> 0
++  0x00,         /*nInterfaceProtocol : 0=none, 1=keyboard, 2=mouse*/ // CHANGE 2 -> 0
+   0,            /*iInterface: Index of string descriptor*/
+   /******************** Descriptor of Joystick Mouse HID ********************/
+   /* 18 */
+@@ -317,52 +317,34 @@
+ 
+ __ALIGN_BEGIN static uint8_t HID_MOUSE_ReportDesc[HID_MOUSE_REPORT_DESC_SIZE]  __ALIGN_END =
+ {
+-  0x05,   0x01,
+-  0x09,   0x02,
+-  0xA1,   0x01,
+-  0x09,   0x01,
+-
+-  0xA1,   0x00,
+-  0x05,   0x09,
+-  0x19,   0x01,
+-  0x29,   0x03,
+-
+-  0x15,   0x00,
+-  0x25,   0x01,
+-  0x95,   0x03,
+-  0x75,   0x01,
+-
+-  0x81,   0x02,
+-  0x95,   0x01,
+-  0x75,   0x05,
+-  0x81,   0x01,
+-
+-  0x05,   0x01,
+-  0x09,   0x30,
+-  0x09,   0x31,
+-  0x09,   0x38,
+-
+-  0x15,   0x81,
+-  0x25,   0x7F,
+-  0x75,   0x08,
+-  0x95,   0x03,
+-
+-  0x81,   0x06,
+-  0xC0,   0x09,
+-  0x3c,   0x05,
+-  0xff,   0x09,
+-
+-  0x01,   0x15,
+-  0x00,   0x25,
+-  0x01,   0x75,
+-  0x01,   0x95,
+-
+-  0x02,   0xb1,
+-  0x22,   0x75,
+-  0x06,   0x95,
+-  0x01,   0xb1,
+-
+-  0x01,   0xc0
++		// grabbed from RAMfactory Store dendy-sega usb hub (52 bytes per controller x 4)
++		0x05, 0x01,                    // USAGE_PAGE (Generic Desktop)
++		0x09, 0x04,                    // USAGE (Joystick)
++		0xa1, 0x01,                    // COLLECTION (Application)
++		0x09, 0x01,                    //   USAGE (Pointer)
++		0xa1, 0x00,                    //   COLLECTION (Physical)
++		0x85, 0x01,                    //     REPORT_ID (1)
++		0x09, 0x30,                    //     USAGE (X)
++		0x09, 0x31,                    //     USAGE (Y)
++		0x09, 0x32,                    //     USAGE (Z)
++		0x09, 0x33,                    //     USAGE (Rx)
++		0x09, 0x34,                    //     USAGE (Ry)
++		0x09, 0x35,                    //     USAGE (Rz)
++		0x15, 0x81,                    //     LOGICAL_MINIMUM (-127)
++		0x25, 0x7f,                    //     LOGICAL_MAXIMUM (127)
++		0x75, 0x08,                    //     REPORT_SIZE (8)
++		0x95, 0x06,                    //     REPORT_COUNT (6)
++		0x81, 0x02,                    //     INPUT (Data,Var,Abs)
++		0x05, 0x09,                    //     USAGE_PAGE (Button)
++		0x19, 0x01,                    //     USAGE_MINIMUM (Button 1)
++		0x29, 0x10,                    //     USAGE_MAXIMUM (Button 16)
++		0x15, 0x00,                    //     LOGICAL_MINIMUM (0)
++		0x25, 0x01,                    //     LOGICAL_MAXIMUM (1)
++		0x75, 0x01,                    //     REPORT_SIZE (1)
++		0x95, 0x10,                    //     REPORT_COUNT (16)
++		0x81, 0x02,                    //     INPUT (Data,Var,Abs)
++		0xc0,                          //     END_COLLECTION
++		0xc0                           // END_COLLECTION
+ };
+ 
+ /**
+Index: USB_DEVICE/Target/usbd_conf.h
+===================================================================
+--- USB_DEVICE/Target/usbd_conf.h	(revision 1)
++++ USB_DEVICE/Target/usbd_conf.h	(revision 3)
+@@ -73,7 +73,7 @@
+ /*---------- -----------*/
+ #define USBD_SELF_POWERED     1U
+ /*---------- -----------*/
+-#define HID_FS_BINTERVAL     0xAU
++#define HID_FS_BINTERVAL     1 // CHANGED 0xAU -> 1
+ 
+ /****************************************/
+ /* #define for FS and HS identification */
